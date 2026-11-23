@@ -4,7 +4,7 @@
 
 AgentScope AI is a self-hosted, OpenTelemetry-native observability platform focused on one question: *why is this agent slow, failing, repetitive, or expensive?* It stores real OTLP traces, keeps unknown usage and pricing explicit, and produces deterministic evidence rather than sending telemetry to another LLM.
 
-> Status: `0.1.0rc1`, an experimental preview. OTLP JSON/binary traces, the core Python SDK, PostgreSQL/SQLite persistence, versioned custom pricing, AS001–AS005 diagnostics, project/key management, and trace waterfall views are implemented. OpenAI/LangGraph adapters, retention jobs, production authentication UI, and rate limiting are planned.
+> Status: `0.1.0rc1`, an experimental preview. OTLP JSON/binary traces, the core Python SDK, PostgreSQL/SQLite persistence, versioned custom pricing, AS001–AS005 diagnostics, time-series and performance analytics, budgets/alerts, configurable retention, deterministic sampling, project/key management, and trace waterfall views are implemented. Production authentication UI, distributed rate limiting, and a verified LangGraph adapter are planned.
 
 ## Quick start
 
@@ -43,6 +43,20 @@ def research(question: str):
 
 Decorators do not infer tokens. Record only provider-reported or otherwise identified counts. Prompts, completions, arguments, and return values are not captured by decorators.
 
+The optional OpenAI adapter wraps sync or async `responses.create` calls and records only provider-returned model and usage metadata. It does not capture prompts or completions:
+
+```bash
+pip install 'agentscope-ai[openai]'
+```
+
+```python
+from agentscope_ai.instrumentation.openai import instrument_openai
+
+instrument_openai(scope, openai_client)
+```
+
+The adapter follows the current official [`openai-python` response usage types](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_usage.py). Provider credentials remain optional for the core platform.
+
 ## OTLP ingestion
 
 Send standard OTLP protobuf JSON mapping or binary protobuf to `POST /v1/traces` with `X-AgentScope-Key`. Resource/scope spans, typed attributes, parent IDs, GenAI usage fields, out-of-order trace updates, and retry-safe span identities are supported. Binary `application/x-protobuf` uses the official OpenTelemetry protocol definitions. Compatibility targets stable OTLP traces and recognizes current `gen_ai.*` attributes without discarding unknown fields.
@@ -71,6 +85,10 @@ Money uses `Decimal` and records a pricing version on each span. Unknown price o
 - AS004 uses explicit retry attempt and operation metadata; it never guesses from span names.
 - AS005 flags reported usage with no matching versioned price.
 
+## Operations
+
+The dashboard exposes live request/error/token/cost series, P50/P95 latency, agent/tool performance, searchable traces, cost budgets, and threshold alerts. Project settings control a deterministic trace sample rate and retention period. Error traces bypass sampling. Retention is deliberately operator-triggered: preview the affected trace count in Settings, then explicitly confirm deletion or schedule the same authenticated endpoint externally. Alert evaluation is deterministic and uses a one-hour duplicate-event cooldown.
+
 ## Development and tests
 
 ```bash
@@ -89,6 +107,6 @@ On 2026-11-23, PyPI's official JSON endpoint for `agentscope-ai` returned 404. T
 
 ## Roadmap
 
-Retention workers, richer time-series charts, verified optional provider adapters, production dashboard authentication, and stronger deployment controls.
+Production dashboard authentication, scheduled retention/alert workers, distributed rate limiting, custom-pricing edit/delete UI, a verified LangGraph adapter, broader browser tests, and stronger deployment controls.
 
 MIT licensed. See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).

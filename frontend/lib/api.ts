@@ -1,4 +1,4 @@
-export type Project={id:string;name:string;service_identifier:string};
+export type Project={id:string;name:string;service_identifier:string;retention_days?:number;sample_rate?:number};
 export type Overview={requests:number;errors:number;error_rate:number;input_tokens:number|null;output_tokens:number|null;estimated_cost:string|null;average_latency_ms:number|null};
 export type Trace={trace_id:string;root_operation:string;service_name:string;started_at:string;ended_at:string;duration_ms:number;status:string};
 export type Span={span_id:string;parent_span_id:string|null;operation_name:string;span_kind:string;started_at:string;ended_at:string;duration_ms:number;status:string;attributes:Record<string,unknown>;model:string|null;provider:string|null;input_tokens:number|null;output_tokens:number|null;estimated_cost:string|null};

@@ -1,4 +1,5 @@
 import "./globals.css";
+import "./extensions.css";
 import {Suspense} from "react";
 import type {Metadata} from "next";
 import {Navigation} from "@/components/navigation";

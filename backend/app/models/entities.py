@@ -4,7 +4,9 @@ from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -26,6 +28,8 @@ class Project(Base):
     name: Mapped[str] = mapped_column(String(120))
     service_identifier: Mapped[str] = mapped_column(String(120), unique=True, index=True)
     api_key_hash: Mapped[str] = mapped_column(String(64))
+    retention_days: Mapped[int] = mapped_column(Integer, default=30)
+    sample_rate: Mapped[float] = mapped_column(Float, default=1.0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
@@ -50,6 +54,57 @@ class ModelPricing(Base):
     currency: Mapped[str] = mapped_column(String(3), default="USD")
     source: Mapped[str] = mapped_column(String(255), default="custom")
     version: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+
+
+class Budget(Base):
+    __tablename__ = "budgets"
+    __table_args__ = (UniqueConstraint("project_id", "period"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    period: Mapped[str] = mapped_column(String(16), default="monthly")
+    limit_amount: Mapped[Decimal] = mapped_column(Numeric(18, 8))
+    currency: Mapped[str] = mapped_column(String(3), default="USD")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+
+
+class AlertRule(Base):
+    __tablename__ = "alert_rules"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(120))
+    metric: Mapped[str] = mapped_column(String(32))
+    threshold: Mapped[Decimal] = mapped_column(Numeric(18, 8))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+
+
+class AlertEvent(Base):
+    __tablename__ = "alert_events"
+    __table_args__ = (Index("ix_alert_project_created", "project_id", "created_at"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    rule_id: Mapped[int | None] = mapped_column(
+        ForeignKey("alert_rules.id", ondelete="SET NULL"), nullable=True
+    )
+    severity: Mapped[str] = mapped_column(String(16))
+    title: Mapped[str] = mapped_column(String(255))
+    metric: Mapped[str] = mapped_column(String(32))
+    observed_value: Mapped[Decimal] = mapped_column(Numeric(18, 8))
+    threshold: Mapped[Decimal] = mapped_column(Numeric(18, 8))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )

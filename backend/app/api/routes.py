@@ -1,4 +1,4 @@
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Annotated, Any
 
@@ -13,7 +13,16 @@ from app.diagnostics.engine import (
     token_usage_spike,
 )
 from app.ingestion.otlp import OtlpError, parse
-from app.models import DiagnosticFinding, ModelPricing, Project, Span, Trace
+from app.models import (
+    AlertEvent,
+    AlertRule,
+    Budget,
+    DiagnosticFinding,
+    ModelPricing,
+    Project,
+    Span,
+    Trace,
+)
 from app.storage.database import get_session
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from google.protobuf.json_format import MessageToDict
@@ -41,6 +50,24 @@ class PricingCreate(BaseModel):
     currency: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
     source: str = Field(default="custom", min_length=1, max_length=255)
     version: str = Field(min_length=1, max_length=64)
+
+
+class ProjectSettings(BaseModel):
+    retention_days: int = Field(ge=1, le=3650)
+    sample_rate: float = Field(ge=0.01, le=1.0)
+
+
+class BudgetUpsert(BaseModel):
+    limit_amount: Decimal = Field(gt=0)
+    currency: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
+    enabled: bool = True
+
+
+class AlertRuleCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    metric: str = Field(pattern=r"^(error_rate|p95_latency_ms|estimated_cost)$")
+    threshold: Decimal = Field(gt=0)
+    enabled: bool = True
 
 
 async def admin_auth(authorization: Annotated[str | None, Header()] = None) -> None:
@@ -122,6 +149,8 @@ async def projects(session: SessionDep) -> list[dict[str, Any]]:
             "name": p.name,
             "service_identifier": p.service_identifier,
             "created_at": p.created_at,
+            "retention_days": p.retention_days,
+            "sample_rate": p.sample_rate,
         }
         for p in rows
     ]
@@ -140,6 +169,51 @@ async def rotate_ingestion_key(project_id: str, session: SessionDep) -> dict[str
         "project_id": project.id,
         "ingestion_key": key,
         "message": "Previous ingestion key revoked; store this key now.",
+    }
+
+
+@router.patch(
+    "/api/projects/{project_id}/settings",
+    dependencies=[Depends(admin_auth)],
+)
+async def update_project_settings(
+    project_id: str, data: ProjectSettings, session: SessionDep
+) -> dict[str, Any]:
+    project = await scoped_project(project_id, session)
+    project.retention_days = data.retention_days
+    project.sample_rate = data.sample_rate
+    await session.commit()
+    return {
+        "project_id": project.id,
+        "retention_days": project.retention_days,
+        "sample_rate": project.sample_rate,
+    }
+
+
+@router.post(
+    "/api/projects/{project_id}/retention/run",
+    dependencies=[Depends(admin_auth)],
+)
+async def run_retention(
+    project_id: str, session: SessionDep, dry_run: bool = Query(True)
+) -> dict[str, Any]:
+    project = await scoped_project(project_id, session)
+    cutoff = datetime.now(UTC) - timedelta(days=project.retention_days)
+    traces = (
+        await session.scalars(
+            select(Trace).where(Trace.project_id == project_id, Trace.started_at < cutoff)
+        )
+    ).all()
+    if not dry_run:
+        for trace in traces:
+            await session.delete(trace)
+        await session.commit()
+    return {
+        "dry_run": dry_run,
+        "retention_days": project.retention_days,
+        "cutoff": cutoff,
+        "matched_traces": len(traces),
+        "deleted_traces": 0 if dry_run else len(traces),
     }
 
 
@@ -252,6 +326,15 @@ async def ingest(
         parsed = parse(payload, get_settings().max_spans_per_request)
     except (OtlpError, ValueError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    sample_rate = project.sample_rate if project.sample_rate is not None else 1.0
+    error_trace_ids = {span.trace_id for span in parsed if span.status == "ERROR"}
+    kept_trace_ids = {
+        span.trace_id
+        for span in parsed
+        if span.trace_id in error_trace_ids or int(span.trace_id, 16) / float(2**128) < sample_rate
+    }
+    sampled_out = sum(1 for span in parsed if span.trace_id not in kept_trace_ids)
+    parsed = [span for span in parsed if span.trace_id in kept_trace_ids]
     trace_ids = {s.trace_id for s in parsed}
     existing_traces = {
         t.trace_id: t
@@ -373,7 +456,15 @@ async def ingest(
     except Exception:
         await session.rollback()
         raise HTTPException(status_code=503, detail="telemetry persistence failed") from None
-    return {"partialSuccess": {}, "acceptedSpans": accepted}
+    partial_success = (
+        {
+            "rejectedSpans": sampled_out,
+            "errorMessage": "deterministically sampled by project policy",
+        }
+        if sampled_out
+        else {}
+    )
+    return {"partialSuccess": partial_success, "acceptedSpans": accepted}
 
 
 def _integer(value: object) -> int | None:
@@ -399,15 +490,44 @@ async def traces(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     status_filter: str | None = Query(None, alias="status"),
+    search: str | None = Query(None, max_length=255),
+    service: str | None = Query(None, max_length=255),
+    agent: str | None = Query(None, max_length=255),
+    model: str | None = Query(None, max_length=255),
+    min_duration_ms: float | None = Query(None, ge=0),
+    started_after: datetime | None = None,
+    started_before: datetime | None = None,
 ) -> dict[str, Any]:
     await scoped_project(project_id, session)
     query = select(Trace).where(Trace.project_id == project_id)
     if status_filter:
         query = query.where(Trace.status == status_filter)
+    if search:
+        query = query.where(
+            or_(Trace.trace_id.ilike(f"%{search}%"), Trace.root_operation.ilike(f"%{search}%"))
+        )
+    if service:
+        query = query.where(Trace.service_name == service)
+    if agent:
+        query = query.where(Trace.root_operation == agent)
+    if model:
+        query = query.where(Trace.spans.any(Span.model == model))
+    if min_duration_ms is not None:
+        query = query.where(Trace.duration_ms >= min_duration_ms)
+    if started_after:
+        query = query.where(Trace.started_at >= started_after)
+    if started_before:
+        query = query.where(Trace.started_at <= started_before)
+    total = await session.scalar(select(func.count()).select_from(query.subquery()))
     rows = (
         await session.scalars(query.order_by(Trace.started_at.desc()).limit(limit).offset(offset))
     ).all()
-    return {"items": [_trace(t) for t in rows], "limit": limit, "offset": offset}
+    return {
+        "items": [_trace(t) for t in rows],
+        "limit": limit,
+        "offset": offset,
+        "total": total or 0,
+    }
 
 
 @router.get("/api/projects/{project_id}/traces/{trace_id}", dependencies=[Depends(admin_auth)])
@@ -512,6 +632,114 @@ def _percentile(values: list[float], quantile: float) -> float | None:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
+@router.get("/api/projects/{project_id}/timeseries", dependencies=[Depends(admin_auth)])
+async def timeseries(
+    project_id: str,
+    session: SessionDep,
+    days: int = Query(7, ge=1, le=365),
+) -> dict[str, Any]:
+    await scoped_project(project_id, session)
+    start = datetime.now(UTC) - timedelta(days=days)
+    traces = (
+        await session.scalars(
+            select(Trace)
+            .where(Trace.project_id == project_id, Trace.started_at >= start)
+            .order_by(Trace.started_at)
+        )
+    ).all()
+    spans = (
+        await session.scalars(
+            select(Span).where(Span.project_id == project_id, Span.started_at >= start)
+        )
+    ).all()
+    buckets: dict[str, dict[str, Any]] = {}
+    for trace in traces:
+        key = _aware(trace.started_at).date().isoformat()
+        bucket = buckets.setdefault(
+            key,
+            {
+                "date": key,
+                "requests": 0,
+                "errors": 0,
+                "tokens": 0,
+                "cost": Decimal(0),
+                "latencies": [],
+            },
+        )
+        bucket["requests"] += 1
+        bucket["errors"] += int(trace.status == "ERROR")
+        bucket["latencies"].append(trace.duration_ms)
+    for span in spans:
+        key = _aware(span.started_at).date().isoformat()
+        bucket = buckets.setdefault(
+            key,
+            {
+                "date": key,
+                "requests": 0,
+                "errors": 0,
+                "tokens": 0,
+                "cost": Decimal(0),
+                "latencies": [],
+            },
+        )
+        bucket["tokens"] += (span.input_tokens or 0) + (span.output_tokens or 0)
+        bucket["cost"] += span.estimated_cost or Decimal(0)
+    items = []
+    for key in sorted(buckets):
+        bucket = buckets[key]
+        requests = bucket["requests"]
+        items.append(
+            {
+                "date": key,
+                "requests": requests,
+                "errors": bucket["errors"],
+                "error_rate": bucket["errors"] / requests if requests else 0,
+                "tokens": bucket["tokens"],
+                "estimated_cost": str(bucket["cost"]),
+                "p50_latency_ms": _percentile(bucket["latencies"], 0.5),
+                "p95_latency_ms": _percentile(bucket["latencies"], 0.95),
+            }
+        )
+    return {"days": days, "items": items}
+
+
+@router.get("/api/projects/{project_id}/performance", dependencies=[Depends(admin_auth)])
+async def performance(project_id: str, session: SessionDep) -> dict[str, Any]:
+    await scoped_project(project_id, session)
+    traces = (await session.scalars(select(Trace).where(Trace.project_id == project_id))).all()
+    spans = (await session.scalars(select(Span).where(Span.project_id == project_id))).all()
+    agent_groups: dict[str, list[Trace]] = {}
+    for trace in traces:
+        agent_groups.setdefault(trace.root_operation, []).append(trace)
+    tool_groups: dict[str, list[Span]] = {}
+    for span in spans:
+        tool = span.attributes.get("tool.name") or span.attributes.get("gen_ai.tool.name")
+        if tool:
+            tool_groups.setdefault(str(tool), []).append(span)
+    return {
+        "agents": [
+            {
+                "name": name,
+                "requests": len(items),
+                "error_rate": sum(item.status == "ERROR" for item in items) / len(items),
+                "average_latency_ms": sum(item.duration_ms for item in items) / len(items),
+                "p95_latency_ms": _percentile([item.duration_ms for item in items], 0.95),
+            }
+            for name, items in sorted(agent_groups.items())
+        ],
+        "tools": [
+            {
+                "name": name,
+                "calls": len(items),
+                "error_rate": sum(item.status == "ERROR" for item in items) / len(items),
+                "average_latency_ms": sum(item.duration_ms for item in items) / len(items),
+                "p95_latency_ms": _percentile([item.duration_ms for item in items], 0.95),
+            }
+            for name, items in sorted(tool_groups.items())
+        ],
+    }
+
+
 @router.get("/api/projects/{project_id}/usage", dependencies=[Depends(admin_auth)])
 async def usage(project_id: str, session: SessionDep) -> dict[str, Any]:
     await scoped_project(project_id, session)
@@ -593,6 +821,160 @@ async def models(project_id: str, session: SessionDep) -> list[dict[str, Any]]:
         )
     ).all()
     return [{"provider": p, "model": m} for p, m in rows]
+
+
+@router.get("/api/projects/{project_id}/budget", dependencies=[Depends(admin_auth)])
+async def get_budget(project_id: str, session: SessionDep) -> dict[str, Any]:
+    await scoped_project(project_id, session)
+    budget = await session.scalar(
+        select(Budget).where(Budget.project_id == project_id, Budget.period == "monthly")
+    )
+    month_start = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    spent = await session.scalar(
+        select(func.sum(Span.estimated_cost)).where(
+            Span.project_id == project_id, Span.started_at >= month_start
+        )
+    )
+    return {
+        "period": "monthly",
+        "limit_amount": str(budget.limit_amount) if budget else None,
+        "currency": budget.currency if budget else "USD",
+        "enabled": budget.enabled if budget else False,
+        "spent_amount": str(spent or Decimal(0)),
+        "usage_percent": (
+            float((spent or Decimal(0)) / budget.limit_amount * 100) if budget else None
+        ),
+    }
+
+
+@router.put("/api/projects/{project_id}/budget", dependencies=[Depends(admin_auth)])
+async def put_budget(project_id: str, data: BudgetUpsert, session: SessionDep) -> dict[str, Any]:
+    await scoped_project(project_id, session)
+    budget = await session.scalar(
+        select(Budget).where(Budget.project_id == project_id, Budget.period == "monthly")
+    )
+    if budget is None:
+        budget = Budget(project_id=project_id, period="monthly", limit_amount=data.limit_amount)
+        session.add(budget)
+    budget.limit_amount = data.limit_amount
+    budget.currency = data.currency
+    budget.enabled = data.enabled
+    await session.commit()
+    return await get_budget(project_id, session)
+
+
+@router.get("/api/projects/{project_id}/alerts", dependencies=[Depends(admin_auth)])
+async def alerts(project_id: str, session: SessionDep) -> dict[str, Any]:
+    await scoped_project(project_id, session)
+    rules = (
+        await session.scalars(
+            select(AlertRule)
+            .where(AlertRule.project_id == project_id)
+            .order_by(AlertRule.created_at)
+        )
+    ).all()
+    events = (
+        await session.scalars(
+            select(AlertEvent)
+            .where(AlertEvent.project_id == project_id)
+            .order_by(AlertEvent.created_at.desc())
+            .limit(100)
+        )
+    ).all()
+    return {
+        "rules": [
+            {
+                "id": rule.id,
+                "name": rule.name,
+                "metric": rule.metric,
+                "threshold": str(rule.threshold),
+                "enabled": rule.enabled,
+            }
+            for rule in rules
+        ],
+        "events": [
+            {
+                "id": event.id,
+                "rule_id": event.rule_id,
+                "severity": event.severity,
+                "title": event.title,
+                "metric": event.metric,
+                "observed_value": str(event.observed_value),
+                "threshold": str(event.threshold),
+                "created_at": event.created_at,
+            }
+            for event in events
+        ],
+    }
+
+
+@router.post(
+    "/api/projects/{project_id}/alerts/rules",
+    status_code=201,
+    dependencies=[Depends(admin_auth)],
+)
+async def create_alert_rule(
+    project_id: str, data: AlertRuleCreate, session: SessionDep
+) -> dict[str, Any]:
+    await scoped_project(project_id, session)
+    rule = AlertRule(project_id=project_id, **data.model_dump())
+    session.add(rule)
+    await session.commit()
+    await session.refresh(rule)
+    return {"id": rule.id, **data.model_dump(mode="json")}
+
+
+@router.post(
+    "/api/projects/{project_id}/alerts/evaluate",
+    dependencies=[Depends(admin_auth)],
+)
+async def evaluate_alerts(project_id: str, session: SessionDep) -> dict[str, int]:
+    await scoped_project(project_id, session)
+    rules = (
+        await session.scalars(
+            select(AlertRule).where(AlertRule.project_id == project_id, AlertRule.enabled.is_(True))
+        )
+    ).all()
+    traces = (await session.scalars(select(Trace).where(Trace.project_id == project_id))).all()
+    costs_total = await session.scalar(
+        select(func.sum(Span.estimated_cost)).where(Span.project_id == project_id)
+    )
+    metrics = {
+        "error_rate": Decimal(str(sum(t.status == "ERROR" for t in traces) / len(traces)))
+        if traces
+        else Decimal(0),
+        "p95_latency_ms": Decimal(str(_percentile([t.duration_ms for t in traces], 0.95) or 0)),
+        "estimated_cost": costs_total or Decimal(0),
+    }
+    created = 0
+    cooldown = datetime.now(UTC) - timedelta(hours=1)
+    for rule in rules:
+        observed = metrics[rule.metric]
+        if observed < rule.threshold:
+            continue
+        recent = await session.scalar(
+            select(AlertEvent.id).where(
+                AlertEvent.project_id == project_id,
+                AlertEvent.rule_id == rule.id,
+                AlertEvent.created_at >= cooldown,
+            )
+        )
+        if recent:
+            continue
+        session.add(
+            AlertEvent(
+                project_id=project_id,
+                rule_id=rule.id,
+                severity="warning",
+                title=f"{rule.name}: threshold exceeded",
+                metric=rule.metric,
+                observed_value=observed,
+                threshold=rule.threshold,
+            )
+        )
+        created += 1
+    await session.commit()
+    return {"created": created}
 
 
 @router.post("/api/projects/{project_id}/diagnostics/run", dependencies=[Depends(admin_auth)])
