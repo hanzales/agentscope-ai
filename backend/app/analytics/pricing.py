@@ -50,3 +50,21 @@ def calculate(
     if cached_tokens and price.cached_per_million is not None:
         total += Decimal(cached_tokens) * price.cached_per_million / million
     return total.quantize(Decimal("0.00000001")), price.version
+
+
+def calculate_rates(
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cached_tokens: int | None,
+    input_per_million: Decimal,
+    output_per_million: Decimal,
+    cached_per_million: Decimal | None,
+) -> Decimal | None:
+    if input_tokens is None and output_tokens is None and cached_tokens is None:
+        return None
+    million = Decimal(1_000_000)
+    total = Decimal(input_tokens or 0) * input_per_million / million
+    total += Decimal(output_tokens or 0) * output_per_million / million
+    if cached_tokens and cached_per_million is not None:
+        total += Decimal(cached_tokens) * cached_per_million / million
+    return total.quantize(Decimal("0.00000001"))

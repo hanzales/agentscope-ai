@@ -1,18 +1,25 @@
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time
+from decimal import Decimal
 from typing import Annotated, Any
 
-from app.analytics.pricing import calculate
+from app.analytics.pricing import calculate, calculate_rates
 from app.core.config import get_settings
 from app.core.security import hash_api_key, issue_api_key, verify_api_key
-from app.diagnostics.engine import critical_path_ms, repeated_tool_calls
+from app.diagnostics.engine import (
+    agent_bottleneck,
+    critical_path_ms,
+    high_retry_count,
+    repeated_tool_calls,
+    token_usage_spike,
+)
 from app.ingestion.otlp import OtlpError, parse
-from app.models import DiagnosticFinding, Project, Span, Trace
+from app.models import DiagnosticFinding, ModelPricing, Project, Span, Trace
 from app.storage.database import get_session
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from google.protobuf.json_format import MessageToDict
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter()
@@ -22,6 +29,18 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     service_identifier: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=120)
+
+
+class PricingCreate(BaseModel):
+    provider: str = Field(min_length=1, max_length=100)
+    model: str = Field(min_length=1, max_length=255)
+    effective_date: date
+    input_per_million: Decimal = Field(ge=0)
+    output_per_million: Decimal = Field(ge=0)
+    cached_per_million: Decimal | None = Field(default=None, ge=0)
+    currency: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
+    source: str = Field(default="custom", min_length=1, max_length=255)
+    version: str = Field(min_length=1, max_length=64)
 
 
 async def admin_auth(authorization: Annotated[str | None, Header()] = None) -> None:
@@ -108,6 +127,110 @@ async def projects(session: SessionDep) -> list[dict[str, Any]]:
     ]
 
 
+@router.post(
+    "/api/projects/{project_id}/keys/rotate",
+    dependencies=[Depends(admin_auth)],
+)
+async def rotate_ingestion_key(project_id: str, session: SessionDep) -> dict[str, str]:
+    project = await scoped_project(project_id, session)
+    key = issue_api_key()
+    project.api_key_hash = hash_api_key(key)
+    await session.commit()
+    return {
+        "project_id": project.id,
+        "ingestion_key": key,
+        "message": "Previous ingestion key revoked; store this key now.",
+    }
+
+
+@router.get(
+    "/api/projects/{project_id}/pricing",
+    dependencies=[Depends(admin_auth)],
+)
+async def list_pricing(project_id: str, session: SessionDep) -> list[dict[str, Any]]:
+    await scoped_project(project_id, session)
+    rows = (
+        await session.scalars(
+            select(ModelPricing)
+            .where(ModelPricing.project_id == project_id)
+            .order_by(ModelPricing.provider, ModelPricing.model, ModelPricing.effective_date.desc())
+        )
+    ).all()
+    return [_pricing(row) for row in rows]
+
+
+@router.post(
+    "/api/projects/{project_id}/pricing",
+    status_code=201,
+    dependencies=[Depends(admin_auth)],
+)
+async def create_pricing(
+    project_id: str, data: PricingCreate, session: SessionDep
+) -> dict[str, Any]:
+    await scoped_project(project_id, session)
+    effective = datetime.combine(data.effective_date, time.min, tzinfo=UTC)
+    exists = await session.scalar(
+        select(ModelPricing.id).where(
+            ModelPricing.project_id == project_id,
+            ModelPricing.provider == data.provider,
+            ModelPricing.model == data.model,
+            ModelPricing.effective_date == effective,
+        )
+    )
+    if exists:
+        raise HTTPException(status_code=409, detail="pricing version already exists")
+    row = ModelPricing(
+        project_id=project_id,
+        provider=data.provider,
+        model=data.model,
+        effective_date=effective,
+        input_per_million=data.input_per_million,
+        output_per_million=data.output_per_million,
+        cached_per_million=data.cached_per_million,
+        currency=data.currency,
+        source=data.source,
+        version=data.version,
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return _pricing(row)
+
+
+@router.delete(
+    "/api/projects/{project_id}/pricing/{pricing_id}",
+    status_code=204,
+    dependencies=[Depends(admin_auth)],
+)
+async def delete_pricing(project_id: str, pricing_id: int, session: SessionDep) -> None:
+    row = await session.scalar(
+        select(ModelPricing).where(
+            ModelPricing.id == pricing_id, ModelPricing.project_id == project_id
+        )
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="pricing version not found")
+    await session.delete(row)
+    await session.commit()
+
+
+def _pricing(row: ModelPricing) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "provider": row.provider,
+        "model": row.model,
+        "effective_date": row.effective_date,
+        "input_per_million": str(row.input_per_million),
+        "output_per_million": str(row.output_per_million),
+        "cached_per_million": (
+            str(row.cached_per_million) if row.cached_per_million is not None else None
+        ),
+        "currency": row.currency,
+        "source": row.source,
+        "version": row.version,
+    }
+
+
 @router.post("/v1/traces", status_code=200)
 async def ingest(
     request: Request, session: SessionDep, x_agentscope_key: Annotated[str | None, Header()] = None
@@ -190,6 +313,28 @@ async def ingest(
                     cached_tokens,
                     item.started_at.date(),
                 )
+                if provider and model:
+                    custom_price = await session.scalar(
+                        select(ModelPricing)
+                        .where(
+                            ModelPricing.project_id == project.id,
+                            ModelPricing.provider == str(provider),
+                            ModelPricing.model == str(model),
+                            ModelPricing.effective_date <= item.started_at,
+                        )
+                        .order_by(ModelPricing.effective_date.desc())
+                        .limit(1)
+                    )
+                    if custom_price is not None:
+                        cost = calculate_rates(
+                            input_tokens,
+                            output_tokens,
+                            cached_tokens,
+                            custom_price.input_per_million,
+                            custom_price.output_per_million,
+                            custom_price.cached_per_million,
+                        )
+                        version = custom_price.version
                 values = dict(
                     parent_span_id=item.parent_span_id,
                     operation_name=item.name,
@@ -340,6 +485,9 @@ async def overview(project_id: str, session: SessionDep) -> dict[str, Any]:
         .where(Span.project_id == project_id)
     )
     inp, out, cost, avg = usage.one()
+    durations = list(
+        await session.scalars(select(Trace.duration_ms).where(Trace.project_id == project_id))
+    )
     return {
         "requests": traces_count or 0,
         "errors": errors or 0,
@@ -348,7 +496,20 @@ async def overview(project_id: str, session: SessionDep) -> dict[str, Any]:
         "output_tokens": out,
         "estimated_cost": str(cost) if cost is not None else None,
         "average_latency_ms": avg,
+        "p50_latency_ms": _percentile(durations, 0.50),
+        "p95_latency_ms": _percentile(durations, 0.95),
     }
+
+
+def _percentile(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
 @router.get("/api/projects/{project_id}/usage", dependencies=[Depends(admin_auth)])
@@ -376,7 +537,26 @@ async def costs(project_id: str, session: SessionDep) -> dict[str, Any]:
     await scoped_project(project_id, session)
     rows = (
         await session.execute(
-            select(Span.provider, Span.model, func.sum(Span.estimated_cost), func.count())
+            select(
+                Span.provider,
+                Span.model,
+                func.sum(Span.estimated_cost),
+                func.count(),
+                func.sum(
+                    case(
+                        (
+                            and_(
+                                or_(
+                                    Span.input_tokens.is_not(None), Span.output_tokens.is_not(None)
+                                ),
+                                Span.estimated_cost.is_(None),
+                            ),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+            )
             .where(Span.project_id == project_id)
             .group_by(Span.provider, Span.model)
         )
@@ -388,9 +568,16 @@ async def costs(project_id: str, session: SessionDep) -> dict[str, Any]:
                 "model": m,
                 "estimated_cost": str(c) if c is not None else None,
                 "span_count": n,
-                "pricing_status": "known" if c is not None else "unknown",
+                "unknown_usage_spans": unknown_count,
+                "pricing_status": (
+                    "partial"
+                    if c is not None and unknown_count
+                    else "known"
+                    if c is not None
+                    else "unknown"
+                ),
             }
-            for p, m, c, n in rows
+            for p, m, c, n, unknown_count in rows
         ]
     }
 
@@ -411,15 +598,25 @@ async def models(project_id: str, session: SessionDep) -> list[dict[str, Any]]:
 @router.post("/api/projects/{project_id}/diagnostics/run", dependencies=[Depends(admin_auth)])
 async def run_diagnostics(project_id: str, session: SessionDep) -> dict[str, int]:
     await scoped_project(project_id, session)
-    traces = (await session.scalars(select(Trace).where(Trace.project_id == project_id))).all()
+    traces = (
+        await session.scalars(
+            select(Trace).where(Trace.project_id == project_id).order_by(Trace.started_at)
+        )
+    ).all()
+    all_spans = (await session.scalars(select(Span).where(Span.project_id == project_id))).all()
+    spans_by_trace: dict[str, list[Span]] = {}
+    for span in all_spans:
+        spans_by_trace.setdefault(span.trace_id, []).append(span)
+    historical_totals: list[int] = []
     created = 0
     for trace in traces:
-        spans = (
-            await session.scalars(
-                select(Span).where(Span.project_id == project_id, Span.trace_id == trace.trace_id)
-            )
-        ).all()
-        findings = repeated_tool_calls(list(spans))
+        spans = spans_by_trace.get(trace.trace_id, [])
+        findings = [
+            *repeated_tool_calls(spans),
+            *agent_bottleneck(spans),
+            *token_usage_spike(trace.trace_id, spans, historical_totals),
+            *high_retry_count(spans),
+        ]
         for span in spans:
             if (
                 span.input_tokens is not None or span.output_tokens is not None
@@ -453,6 +650,9 @@ async def run_diagnostics(project_id: str, session: SessionDep) -> dict[str, int
             if not exists:
                 session.add(DiagnosticFinding(project_id=project_id, trace_id=trace.trace_id, **f))
                 created += 1
+        trace_tokens = sum((span.input_tokens or 0) + (span.output_tokens or 0) for span in spans)
+        if trace_tokens > 0:
+            historical_totals.append(trace_tokens)
     await session.commit()
     return {"created": created}
 

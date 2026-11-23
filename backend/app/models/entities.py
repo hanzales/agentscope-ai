@@ -31,6 +31,30 @@ class Project(Base):
     )
 
 
+class ModelPricing(Base):
+    __tablename__ = "model_pricing"
+    __table_args__ = (
+        UniqueConstraint("project_id", "provider", "model", "effective_date"),
+        Index("ix_pricing_lookup", "project_id", "provider", "model", "effective_date"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    provider: Mapped[str] = mapped_column(String(100))
+    model: Mapped[str] = mapped_column(String(255))
+    effective_date: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    input_per_million: Mapped[Decimal] = mapped_column(Numeric(18, 8))
+    output_per_million: Mapped[Decimal] = mapped_column(Numeric(18, 8))
+    cached_per_million: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    currency: Mapped[str] = mapped_column(String(3), default="USD")
+    source: Mapped[str] = mapped_column(String(255), default="custom")
+    version: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+
+
 class Trace(Base):
     __tablename__ = "traces"
     __table_args__ = (

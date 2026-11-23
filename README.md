@@ -4,7 +4,7 @@
 
 AgentScope AI is a self-hosted, OpenTelemetry-native observability platform focused on one question: *why is this agent slow, failing, repetitive, or expensive?* It stores real OTLP traces, keeps unknown usage and pricing explicit, and produces deterministic evidence rather than sending telemetry to another LLM.
 
-> Status: `0.1.0rc1`, an experimental preview. OTLP protobuf JSON and binary traces, the core Python SDK, PostgreSQL/SQLite persistence, trace/cost APIs, AS001/AS005 diagnostics, and live API-backed dashboard views are implemented. Key rotation UI, AS002–AS004, full percentile charts, OpenAI/LangGraph adapters, retention jobs, and production rate limiting are planned.
+> Status: `0.1.0rc1`, an experimental preview. OTLP JSON/binary traces, the core Python SDK, PostgreSQL/SQLite persistence, versioned custom pricing, AS001–AS005 diagnostics, project/key management, and trace waterfall views are implemented. OpenAI/LangGraph adapters, retention jobs, production authentication UI, and rate limiting are planned.
 
 ## Quick start
 
@@ -14,6 +14,7 @@ Python 3.12+ and Node 22+:
 python -m venv .venv
 .venv/bin/pip install -e 'backend[dev]' -e 'sdk/python[dev]'
 cd frontend && npm install && cd ..
+cd backend && AGENTSCOPE_DATABASE_URL=sqlite+aiosqlite:///../agentscope.db ../.venv/bin/alembic upgrade head && cd ..
 AGENTSCOPE_DATABASE_URL=sqlite+aiosqlite:///./agentscope.db .venv/bin/uvicorn app.main:app --app-dir backend
 ```
 
@@ -58,15 +59,17 @@ Services bind to loopback by default. PostgreSQL has a persistent volume and ser
 
 ## Security and privacy
 
-Ingestion keys are random and stored only as SHA-256 hashes; comparison is constant-time. Administrative reads require `AGENTSCOPE_ADMIN_TOKEN` when demo mode is disabled. CORS is an explicit allowlist. Request and batch sizes are bounded. Logs never include request bodies. Core instrumentation does not capture prompts, completions, call arguments, or results. This preview does not yet implement distributed rate limiting or a rotation endpoint.
+Ingestion keys are random and stored only as SHA-256 hashes; comparison is constant-time. Keys can be rotated from the Projects screen and the old credential is revoked immediately. Administrative reads require `AGENTSCOPE_ADMIN_TOKEN` when demo mode is disabled. CORS is an explicit allowlist. Request and batch sizes are bounded. Logs never include request bodies. Core instrumentation does not capture prompts, completions, call arguments, or results. This preview does not yet implement distributed rate limiting or production dashboard login.
 
 ## Costs and diagnostics
 
-Money uses `Decimal` and records a pricing version on each span. Unknown price or absent usage stays `null`, never zero. The bundled `demo/simulated-model` price is illustrative demo data, not current vendor pricing. Custom pricing management is planned.
+Money uses `Decimal` and records a pricing version on each span. Unknown price or absent usage stays `null`, never zero. The bundled `demo/simulated-model` price is illustrative demo data, not current vendor pricing. Custom pricing versions are managed from Projects and apply only to newly ingested spans, preserving historical reproducibility.
 
 - AS001 detects repeated tools using tool name plus a safe fingerprint; raw arguments are not retained for this rule.
+- AS002 identifies a span occupying at least half of a trace critical path and at least 100 ms.
+- AS003 requires ten historical token-bearing traces and flags usage at least twice the median.
+- AS004 uses explicit retry attempt and operation metadata; it never guesses from span names.
 - AS005 flags reported usage with no matching versioned price.
-- AS002–AS004 are documented roadmap items and are not advertised as active.
 
 ## Development and tests
 
@@ -82,10 +85,10 @@ Architecture is a modular monolith: FastAPI ingestion/API/analytics modules shar
 
 ## Name check
 
-On 2026-11-23, `gh repo view hanzales/agentscope-ai` reported no repository and PyPI's official JSON endpoint for `agentscope-ai` returned 404. This is a point-in-time availability check, not a trademark or uniqueness claim. Nothing has been created or published remotely.
+On 2026-11-23, PyPI's official JSON endpoint for `agentscope-ai` returned 404. The public source repository is now `hanzales/agentscope-ai`; no package has been published. This remains a point-in-time availability check, not a trademark or uniqueness claim.
 
 ## Roadmap
 
-All five diagnostic rules, persisted pricing administration, API-key rotation, retention workers, richer trace waterfall/percentiles, verified optional provider adapters, and stronger deployment controls.
+Retention workers, richer time-series charts, verified optional provider adapters, production dashboard authentication, and stronger deployment controls.
 
 MIT licensed. See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).

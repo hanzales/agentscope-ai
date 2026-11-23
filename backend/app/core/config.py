@@ -10,7 +10,9 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./agentscope.db"
     demo_mode: bool = True
     admin_token: str | None = None
-    cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    cors_origins: list[str] = Field(
+        default_factory=lambda: ["http://localhost:3000", "http://127.0.0.1:3000"]
+    )
     max_request_bytes: int = 5_000_000
     max_spans_per_request: int = 2_000
     retention_days: int = 30
