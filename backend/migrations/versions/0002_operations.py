@@ -15,8 +15,11 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("projects", sa.Column("retention_days", sa.Integer(), nullable=True))
-    op.add_column("projects", sa.Column("sample_rate", sa.Float(), nullable=True))
+    columns = {column["name"] for column in sa.inspect(op.get_bind()).get_columns("projects")}
+    if "retention_days" not in columns:
+        op.add_column("projects", sa.Column("retention_days", sa.Integer(), nullable=True))
+    if "sample_rate" not in columns:
+        op.add_column("projects", sa.Column("sample_rate", sa.Float(), nullable=True))
     op.execute("UPDATE projects SET retention_days = 30 WHERE retention_days IS NULL")
     op.execute("UPDATE projects SET sample_rate = 1.0 WHERE sample_rate IS NULL")
     for name in ("budgets", "alert_rules", "alert_events"):

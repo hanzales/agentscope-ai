@@ -1,10 +1,18 @@
+import asyncio
+import hashlib
+import hmac
+import ipaddress
+import json
+import socket
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Annotated, Any
+from urllib.parse import urlparse
 
+import httpx
 from app.analytics.pricing import calculate, calculate_rates
 from app.core.config import get_settings
-from app.core.security import hash_api_key, issue_api_key, verify_api_key
+from app.core.security import hash_api_key, issue_access_token, issue_api_key, verify_api_key
 from app.diagnostics.engine import (
     agent_bottleneck,
     critical_path_ms,
@@ -20,11 +28,15 @@ from app.models import (
     DiagnosticFinding,
     ModelPricing,
     Project,
+    ProjectAccessToken,
+    ProjectMember,
     Span,
     Trace,
+    WebhookEndpoint,
 )
 from app.storage.database import get_session
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from google.protobuf.json_format import MessageToDict
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 from pydantic import BaseModel, Field
@@ -70,14 +82,117 @@ class AlertRuleCreate(BaseModel):
     enabled: bool = True
 
 
-async def admin_auth(authorization: Annotated[str | None, Header()] = None) -> None:
+class AccessTokenCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    role: str = Field(pattern=r"^(viewer|editor|admin)$")
+
+
+class MemberUpsert(BaseModel):
+    email: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", max_length=320)
+    role: str = Field(pattern=r"^(viewer|editor|admin)$")
+
+
+class WebhookCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    url: str = Field(min_length=8, max_length=2048)
+    enabled: bool = True
+
+
+async def _validate_webhook_url(value: str) -> None:
+    parsed = urlparse(value)
+    settings = get_settings()
+    if parsed.scheme not in {"https", "http"} or not parsed.hostname or parsed.username:
+        raise HTTPException(status_code=422, detail="webhook URL must be an absolute HTTP(S) URL")
+    if parsed.scheme != "https" and not (
+        settings.demo_mode and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    ):
+        raise HTTPException(status_code=422, detail="webhook URL must use HTTPS")
+    try:
+        records = await asyncio.to_thread(socket.getaddrinfo, parsed.hostname, parsed.port or 443)
+    except OSError as exc:
+        raise HTTPException(status_code=422, detail="webhook host cannot be resolved") from exc
+    if not settings.webhook_allow_private_urls:
+        for record in records:
+            address = ipaddress.ip_address(record[4][0])
+            if address.is_private or address.is_loopback or address.is_link_local:
+                if not (
+                    settings.demo_mode and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+                ):
+                    raise HTTPException(
+                        status_code=422, detail="private webhook targets are disabled"
+                    )
+
+
+async def _deliver_webhooks(endpoints: list[str], payload: dict[str, Any]) -> None:
+    body = json.dumps(payload, separators=(",", ":"), default=str).encode()
+    settings = get_settings()
+    secret = settings.webhook_signing_secret or ("demo-only" if settings.demo_mode else "")
+    if not secret:
+        return
+    signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
+        for endpoint in endpoints:
+            try:
+                await _validate_webhook_url(endpoint)
+                response = await client.post(
+                    endpoint,
+                    content=body,
+                    headers={
+                        "content-type": "application/json",
+                        "x-tamga-signature-256": f"sha256={signature}",
+                    },
+                )
+                response.raise_for_status()
+            except Exception:
+                # Delivery is isolated from requests; operators can retry evaluation.
+                continue
+
+
+async def admin_auth(
+    request: Request,
+    session: SessionDep,
+    authorization: Annotated[str | None, Header()] = None,
+) -> None:
     settings = get_settings()
     if settings.demo_mode:
+        request.state.access_role = "admin"
         return
     expected = settings.admin_token
     supplied = authorization.removeprefix("Bearer ") if authorization else ""
-    if not expected or not secrets_compare(supplied, expected):
-        raise HTTPException(status_code=401, detail="invalid admin credentials")
+    if expected and secrets_compare(supplied, expected):
+        request.state.access_role = "admin"
+        return
+    project_id = request.path_params.get("project_id")
+    if not supplied:
+        raise HTTPException(status_code=401, detail="invalid credentials")
+    if not project_id and request.method == "GET" and request.url.path == "/api/projects":
+        token = await session.scalar(
+            select(ProjectAccessToken).where(
+                ProjectAccessToken.token_hash == hash_api_key(supplied)
+            )
+        )
+        if token is None or not secrets_compare(hash_api_key(supplied), token.token_hash):
+            raise HTTPException(status_code=401, detail="invalid credentials")
+        request.state.access_role = token.role
+        request.state.allowed_project_id = token.project_id
+        token.last_used_at = datetime.now(UTC)
+        await session.commit()
+        return
+    if not project_id:
+        raise HTTPException(status_code=401, detail="admin credentials required")
+    token = await session.scalar(
+        select(ProjectAccessToken).where(
+            ProjectAccessToken.project_id == project_id,
+            ProjectAccessToken.token_hash == hash_api_key(supplied),
+        )
+    )
+    if token is None or not secrets_compare(hash_api_key(supplied), token.token_hash):
+        raise HTTPException(status_code=401, detail="invalid credentials")
+    if request.method not in {"GET", "HEAD"} and token.role == "viewer":
+        raise HTTPException(status_code=403, detail="viewer role is read-only")
+    token.last_used_at = datetime.now(UTC)
+    await session.commit()
+    request.state.access_role = token.role
 
 
 def secrets_compare(a: str, b: str) -> bool:
@@ -141,8 +256,12 @@ async def create_project(data: ProjectCreate, session: SessionDep) -> dict[str, 
 
 
 @router.get("/api/projects", dependencies=[Depends(admin_auth)])
-async def projects(session: SessionDep) -> list[dict[str, Any]]:
-    rows = (await session.scalars(select(Project).order_by(Project.created_at))).all()
+async def projects(request: Request, session: SessionDep) -> list[dict[str, Any]]:
+    query = select(Project).order_by(Project.created_at)
+    allowed = getattr(request.state, "allowed_project_id", None)
+    if allowed:
+        query = query.where(Project.id == allowed)
+    rows = (await session.scalars(query)).all()
     return [
         {
             "id": p.id,
@@ -170,6 +289,118 @@ async def rotate_ingestion_key(project_id: str, session: SessionDep) -> dict[str
         "ingestion_key": key,
         "message": "Previous ingestion key revoked; store this key now.",
     }
+
+
+def require_project_admin(request: Request) -> None:
+    if getattr(request.state, "access_role", None) != "admin":
+        raise HTTPException(status_code=403, detail="project admin role required")
+
+
+@router.get("/api/projects/{project_id}/access", dependencies=[Depends(admin_auth)])
+async def project_access(project_id: str, request: Request, session: SessionDep) -> dict[str, Any]:
+    require_project_admin(request)
+    await scoped_project(project_id, session)
+    members = (
+        await session.scalars(
+            select(ProjectMember)
+            .where(ProjectMember.project_id == project_id)
+            .order_by(ProjectMember.email)
+        )
+    ).all()
+    tokens = (
+        await session.scalars(
+            select(ProjectAccessToken)
+            .where(ProjectAccessToken.project_id == project_id)
+            .order_by(ProjectAccessToken.created_at)
+        )
+    ).all()
+    return {
+        "members": [
+            {"id": row.id, "email": row.email, "role": row.role, "created_at": row.created_at}
+            for row in members
+        ],
+        "tokens": [
+            {
+                "id": row.id,
+                "name": row.name,
+                "role": row.role,
+                "created_at": row.created_at,
+                "last_used_at": row.last_used_at,
+            }
+            for row in tokens
+        ],
+    }
+
+
+@router.put("/api/projects/{project_id}/access/members", dependencies=[Depends(admin_auth)])
+async def upsert_member(
+    project_id: str, data: MemberUpsert, request: Request, session: SessionDep
+) -> dict[str, Any]:
+    require_project_admin(request)
+    await scoped_project(project_id, session)
+    normalized = data.email.lower()
+    member = await session.scalar(
+        select(ProjectMember).where(
+            ProjectMember.project_id == project_id, ProjectMember.email == normalized
+        )
+    )
+    if member is None:
+        member = ProjectMember(project_id=project_id, email=normalized, role=data.role)
+        session.add(member)
+    else:
+        member.role = data.role
+    await session.commit()
+    await session.refresh(member)
+    return {"id": member.id, "email": member.email, "role": member.role}
+
+
+@router.post(
+    "/api/projects/{project_id}/access/tokens",
+    status_code=201,
+    dependencies=[Depends(admin_auth)],
+)
+async def create_access_token(
+    project_id: str, data: AccessTokenCreate, request: Request, session: SessionDep
+) -> dict[str, Any]:
+    require_project_admin(request)
+    await scoped_project(project_id, session)
+    raw = issue_access_token()
+    token = ProjectAccessToken(
+        project_id=project_id, name=data.name, role=data.role, token_hash=hash_api_key(raw)
+    )
+    session.add(token)
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="access token name already exists") from None
+    return {
+        "id": token.id,
+        "name": token.name,
+        "role": token.role,
+        "access_token": raw,
+        "message": "This project access token is shown once; store it securely.",
+    }
+
+
+@router.delete(
+    "/api/projects/{project_id}/access/tokens/{token_id}",
+    status_code=204,
+    dependencies=[Depends(admin_auth)],
+)
+async def revoke_access_token(
+    project_id: str, token_id: int, request: Request, session: SessionDep
+) -> None:
+    require_project_admin(request)
+    token = await session.scalar(
+        select(ProjectAccessToken).where(
+            ProjectAccessToken.id == token_id, ProjectAccessToken.project_id == project_id
+        )
+    )
+    if token is None:
+        raise HTTPException(status_code=404, detail="access token not found")
+    await session.delete(token)
+    await session.commit()
 
 
 @router.patch(
@@ -360,6 +591,11 @@ async def ingest(
         for trace_id, items in by_trace.items():
             start, end = min(i.started_at for i in items), max(i.ended_at for i in items)
             root = next((i for i in items if not i.parent_span_id), items[0])
+            deployment_environment = root.attributes.get("deployment.environment.name")
+            service_version = root.attributes.get("service.version")
+            git_commit = root.attributes.get("vcs.ref.head.revision") or root.attributes.get(
+                "git.commit.sha"
+            )
             trace = existing_traces.get(trace_id)
             if trace is None:
                 trace = Trace(
@@ -371,6 +607,11 @@ async def ingest(
                     ended_at=end,
                     duration_ms=(end - start).total_seconds() * 1000,
                     status="ERROR" if any(i.status == "ERROR" for i in items) else "OK",
+                    deployment_environment=(
+                        str(deployment_environment) if deployment_environment else None
+                    ),
+                    service_version=str(service_version) if service_version else None,
+                    git_commit=str(git_commit)[:64] if git_commit else None,
                 )
                 session.add(trace)
                 await session.flush()
@@ -381,6 +622,15 @@ async def ingest(
                     max(_aware(trace.ended_at), end),
                 )
                 trace.duration_ms = (trace.ended_at - trace.started_at).total_seconds() * 1000
+                trace.deployment_environment = (
+                    str(deployment_environment)
+                    if deployment_environment
+                    else trace.deployment_environment
+                )
+                trace.service_version = (
+                    str(service_version) if service_version else trace.service_version
+                )
+                trace.git_commit = str(git_commit)[:64] if git_commit else trace.git_commit
             for item in items:
                 attrs = item.attributes
                 model = attrs.get("gen_ai.request.model") or attrs.get("gen_ai.response.model")
@@ -560,6 +810,9 @@ def _trace(t: Trace) -> dict[str, Any]:
         "ended_at": t.ended_at,
         "duration_ms": t.duration_ms,
         "status": t.status,
+        "deployment_environment": t.deployment_environment,
+        "service_version": t.service_version,
+        "git_commit": t.git_commit,
     }
 
 
@@ -740,6 +993,95 @@ async def performance(project_id: str, session: SessionDep) -> dict[str, Any]:
     }
 
 
+def _release_key(trace: Trace) -> str:
+    return trace.service_version or trace.git_commit or "unversioned"
+
+
+def _release_summary(name: str, rows: list[Trace]) -> dict[str, Any]:
+    durations = [row.duration_ms for row in rows]
+    return {
+        "release": name,
+        "requests": len(rows),
+        "errors": sum(row.status == "ERROR" for row in rows),
+        "error_rate": sum(row.status == "ERROR" for row in rows) / len(rows),
+        "p50_latency_ms": _percentile(durations, 0.5),
+        "p95_latency_ms": _percentile(durations, 0.95),
+        "first_seen": min(_aware(row.started_at) for row in rows),
+        "last_seen": max(_aware(row.started_at) for row in rows),
+        "environments": sorted({row.deployment_environment or "unknown" for row in rows}),
+    }
+
+
+@router.get("/api/projects/{project_id}/deployments", dependencies=[Depends(admin_auth)])
+async def deployments(project_id: str, session: SessionDep) -> dict[str, Any]:
+    await scoped_project(project_id, session)
+    rows = (
+        await session.scalars(
+            select(Trace).where(Trace.project_id == project_id).order_by(Trace.started_at.desc())
+        )
+    ).all()
+    groups: dict[str, list[Trace]] = {}
+    for trace in rows:
+        groups.setdefault(_release_key(trace), []).append(trace)
+    return {"items": [_release_summary(name, items) for name, items in groups.items()]}
+
+
+@router.get("/api/projects/{project_id}/deployments/compare", dependencies=[Depends(admin_auth)])
+async def compare_deployments(
+    project_id: str,
+    baseline: str,
+    candidate: str,
+    session: SessionDep,
+) -> dict[str, Any]:
+    await scoped_project(project_id, session)
+    rows = (await session.scalars(select(Trace).where(Trace.project_id == project_id))).all()
+    groups = {
+        name: [row for row in rows if _release_key(row) == name] for name in (baseline, candidate)
+    }
+    if not groups[baseline] or not groups[candidate]:
+        raise HTTPException(status_code=404, detail="baseline or candidate release not found")
+    left = _release_summary(baseline, groups[baseline])
+    right = _release_summary(candidate, groups[candidate])
+    return {
+        "baseline": left,
+        "candidate": right,
+        "delta": {
+            "error_rate": right["error_rate"] - left["error_rate"],
+            "p50_latency_ms": right["p50_latency_ms"] - left["p50_latency_ms"],
+            "p95_latency_ms": right["p95_latency_ms"] - left["p95_latency_ms"],
+        },
+    }
+
+
+@router.get("/api/projects/{project_id}/live/traces", dependencies=[Depends(admin_auth)])
+async def trace_stream(project_id: str, request: Request, session: SessionDep) -> StreamingResponse:
+    await scoped_project(project_id, session)
+
+    async def events():
+        last_id = int(
+            await session.scalar(select(func.max(Trace.id)).where(Trace.project_id == project_id))
+            or 0
+        )
+        yield "event: ready\ndata: {}\n\n"
+        while not await request.is_disconnected():
+            rows = (
+                await session.scalars(
+                    select(Trace)
+                    .where(Trace.project_id == project_id, Trace.id > last_id)
+                    .order_by(Trace.id)
+                    .limit(100)
+                )
+            ).all()
+            for trace in rows:
+                last_id = max(last_id, trace.id)
+                yield f"event: trace\ndata: {json.dumps(_trace(trace), default=str)}\n\n"
+            if not rows:
+                yield ": keepalive\n\n"
+            await asyncio.sleep(2)
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+
+
 @router.get("/api/projects/{project_id}/usage", dependencies=[Depends(admin_auth)])
 async def usage(project_id: str, session: SessionDep) -> dict[str, Any]:
     await scoped_project(project_id, session)
@@ -908,6 +1250,61 @@ async def alerts(project_id: str, session: SessionDep) -> dict[str, Any]:
     }
 
 
+@router.get("/api/projects/{project_id}/webhooks", dependencies=[Depends(admin_auth)])
+async def list_webhooks(project_id: str, session: SessionDep) -> list[dict[str, Any]]:
+    await scoped_project(project_id, session)
+    rows = (
+        await session.scalars(
+            select(WebhookEndpoint)
+            .where(WebhookEndpoint.project_id == project_id)
+            .order_by(WebhookEndpoint.created_at)
+        )
+    ).all()
+    return [
+        {"id": row.id, "name": row.name, "url": row.url, "enabled": row.enabled} for row in rows
+    ]
+
+
+@router.post(
+    "/api/projects/{project_id}/webhooks",
+    status_code=201,
+    dependencies=[Depends(admin_auth)],
+)
+async def create_webhook(
+    project_id: str, data: WebhookCreate, request: Request, session: SessionDep
+) -> dict[str, Any]:
+    require_project_admin(request)
+    await scoped_project(project_id, session)
+    if not get_settings().demo_mode and not get_settings().webhook_signing_secret:
+        raise HTTPException(status_code=503, detail="webhook signing secret is not configured")
+    await _validate_webhook_url(data.url)
+    row = WebhookEndpoint(project_id=project_id, **data.model_dump())
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return {"id": row.id, "name": row.name, "url": row.url, "enabled": row.enabled}
+
+
+@router.delete(
+    "/api/projects/{project_id}/webhooks/{webhook_id}",
+    status_code=204,
+    dependencies=[Depends(admin_auth)],
+)
+async def delete_webhook(
+    project_id: str, webhook_id: int, request: Request, session: SessionDep
+) -> None:
+    require_project_admin(request)
+    row = await session.scalar(
+        select(WebhookEndpoint).where(
+            WebhookEndpoint.id == webhook_id, WebhookEndpoint.project_id == project_id
+        )
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="webhook not found")
+    await session.delete(row)
+    await session.commit()
+
+
 @router.post(
     "/api/projects/{project_id}/alerts/rules",
     status_code=201,
@@ -928,7 +1325,9 @@ async def create_alert_rule(
     "/api/projects/{project_id}/alerts/evaluate",
     dependencies=[Depends(admin_auth)],
 )
-async def evaluate_alerts(project_id: str, session: SessionDep) -> dict[str, int]:
+async def evaluate_alerts(
+    project_id: str, background_tasks: BackgroundTasks, session: SessionDep
+) -> dict[str, int]:
     await scoped_project(project_id, session)
     rules = (
         await session.scalars(
@@ -947,6 +1346,7 @@ async def evaluate_alerts(project_id: str, session: SessionDep) -> dict[str, int
         "estimated_cost": costs_total or Decimal(0),
     }
     created = 0
+    notifications: list[dict[str, Any]] = []
     cooldown = datetime.now(UTC) - timedelta(hours=1)
     for rule in rules:
         observed = metrics[rule.metric]
@@ -961,19 +1361,41 @@ async def evaluate_alerts(project_id: str, session: SessionDep) -> dict[str, int
         )
         if recent:
             continue
-        session.add(
-            AlertEvent(
-                project_id=project_id,
-                rule_id=rule.id,
-                severity="warning",
-                title=f"{rule.name}: threshold exceeded",
-                metric=rule.metric,
-                observed_value=observed,
-                threshold=rule.threshold,
-            )
+        event = AlertEvent(
+            project_id=project_id,
+            rule_id=rule.id,
+            severity="warning",
+            title=f"{rule.name}: threshold exceeded",
+            metric=rule.metric,
+            observed_value=observed,
+            threshold=rule.threshold,
+        )
+        session.add(event)
+        notifications.append(
+            {
+                "type": "tamga.alert.triggered",
+                "project_id": project_id,
+                "rule_id": rule.id,
+                "title": event.title,
+                "metric": rule.metric,
+                "observed_value": str(observed),
+                "threshold": str(rule.threshold),
+                "created_at": datetime.now(UTC).isoformat(),
+            }
         )
         created += 1
     await session.commit()
+    if notifications:
+        endpoints = list(
+            await session.scalars(
+                select(WebhookEndpoint.url).where(
+                    WebhookEndpoint.project_id == project_id,
+                    WebhookEndpoint.enabled.is_(True),
+                )
+            )
+        )
+        for notification in notifications:
+            background_tasks.add_task(_deliver_webhooks, endpoints, notification)
     return {"created": created}
 
 

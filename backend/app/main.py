@@ -23,12 +23,12 @@ async def lifespan(_: FastAPI):
     await engine.dispose()
 
 
-app = FastAPI(title="AgentScope AI", version="0.1.0-preview", lifespan=lifespan)
+app = FastAPI(title="TAMGA AI API", version="0.1.0-preview", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_settings().cors_origins,
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type", "X-AgentScope-Key", "X-Request-ID"],
 )
 app.include_router(router)

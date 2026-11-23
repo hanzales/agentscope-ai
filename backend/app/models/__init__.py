@@ -6,8 +6,11 @@ from app.models.entities import (
     DiagnosticFinding,
     ModelPricing,
     Project,
+    ProjectAccessToken,
+    ProjectMember,
     Span,
     Trace,
+    WebhookEndpoint,
 )
 
 __all__ = [
@@ -18,6 +21,9 @@ __all__ = [
     "DiagnosticFinding",
     "ModelPricing",
     "Project",
+    "ProjectAccessToken",
+    "ProjectMember",
     "Span",
     "Trace",
+    "WebhookEndpoint",
 ]

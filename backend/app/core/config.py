@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     max_request_bytes: int = 5_000_000
     max_spans_per_request: int = 2_000
     retention_days: int = 30
+    webhook_signing_secret: str | None = None
+    webhook_allow_private_urls: bool = False
 
 
 @lru_cache

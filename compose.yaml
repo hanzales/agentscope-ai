@@ -19,6 +19,7 @@ services:
       AGENTSCOPE_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-agentscope}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-agentscope}
       AGENTSCOPE_DEMO_MODE: ${AGENTSCOPE_DEMO_MODE:-true}
       AGENTSCOPE_ADMIN_TOKEN: ${AGENTSCOPE_ADMIN_TOKEN:-}
+      AGENTSCOPE_WEBHOOK_SIGNING_SECRET: ${AGENTSCOPE_WEBHOOK_SIGNING_SECRET:-}
     ports: ["127.0.0.1:8000:8000"]
     depends_on:
       postgres: {condition: service_healthy}
@@ -27,6 +28,16 @@ services:
       interval: 10s
       timeout: 3s
       retries: 10
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "-m", "app.worker", "--interval", "3600"]
+    environment:
+      AGENTSCOPE_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-agentscope}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-agentscope}
+    depends_on:
+      backend: {condition: service_healthy}
+    restart: unless-stopped
   frontend:
     build: ./frontend
     environment:
@@ -36,4 +47,3 @@ services:
       backend: {condition: service_healthy}
 volumes:
   postgres_data:
-

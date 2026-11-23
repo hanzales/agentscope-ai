@@ -35,6 +35,50 @@ class Project(Base):
     )
 
 
+class ProjectAccessToken(Base):
+    __tablename__ = "project_access_tokens"
+    __table_args__ = (UniqueConstraint("project_id", "name"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(120))
+    role: Mapped[str] = mapped_column(String(16))
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ProjectMember(Base):
+    __tablename__ = "project_members"
+    __table_args__ = (UniqueConstraint("project_id", "email"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    email: Mapped[str] = mapped_column(String(320))
+    role: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+
+
+class WebhookEndpoint(Base):
+    __tablename__ = "webhook_endpoints"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(120))
+    url: Mapped[str] = mapped_column(String(2048))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+
+
 class ModelPricing(Base):
     __tablename__ = "model_pricing"
     __table_args__ = (
@@ -127,6 +171,9 @@ class Trace(Base):
     ended_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     duration_ms: Mapped[float] = mapped_column()
     status: Mapped[str] = mapped_column(String(32), default="UNSET")
+    deployment_environment: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    service_version: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    git_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
     spans: Mapped[list["Span"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
 
 

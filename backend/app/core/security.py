@@ -7,6 +7,10 @@ def issue_api_key() -> str:
     return f"asai_{secrets.token_urlsafe(32)}"
 
 
+def issue_access_token() -> str:
+    return f"asat_{secrets.token_urlsafe(32)}"
+
+
 def hash_api_key(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 

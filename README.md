@@ -4,7 +4,7 @@
 
 AgentScope AI is a self-hosted, OpenTelemetry-native observability platform focused on one question: *why is this agent slow, failing, repetitive, or expensive?* It stores real OTLP traces, keeps unknown usage and pricing explicit, and produces deterministic evidence rather than sending telemetry to another LLM.
 
-> Status: `0.1.0rc1`, an experimental preview. OTLP JSON/binary traces, the core Python SDK, PostgreSQL/SQLite persistence, versioned custom pricing, AS001–AS005 diagnostics, time-series and performance analytics, budgets/alerts, configurable retention, deterministic sampling, project/key management, and trace waterfall views are implemented. Production authentication UI, distributed rate limiting, and a verified LangGraph adapter are planned.
+> Status: `0.1.0rc1`, an experimental preview. OTLP JSON/binary traces, the core Python SDK, versioned pricing, deterministic diagnostics, time-series/performance analytics, budgets and signed alert webhooks, retention workers, deterministic sampling, project RBAC tokens, deployment comparison, and live trace streaming are implemented. Browser login and distributed rate limiting are planned.
 
 ## Quick start
 
@@ -50,12 +50,12 @@ pip install 'agentscope-ai[openai]'
 ```
 
 ```python
-from agentscope_ai.instrumentation.openai import instrument_openai
+from agentscope_ai.instrumentation.openai import traced_response
 
-instrument_openai(scope, openai_client)
+response = traced_response(scope, openai_client, model="gpt-5-mini", input="Hello")
 ```
 
-The adapter follows the current official [`openai-python` response usage types](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_usage.py). Provider credentials remain optional for the core platform.
+Anthropic `messages.create` and LangGraph `invoke`/`ainvoke` wrappers are also available through the `anthropic` and `langgraph` extras. They instrument only the supplied client or graph instance, avoiding global side effects. The provider adapters follow the current official [OpenAI usage types](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_usage.py), [Anthropic usage types](https://github.com/anthropics/anthropic-sdk-python/blob/main/src/anthropic/types/usage.py), and [LangGraph invocation contract](https://langchain-ai.github.io/langgraph/concepts/low_level/). Provider credentials remain optional for the core platform.
 
 ## OTLP ingestion
 
@@ -73,7 +73,7 @@ Services bind to loopback by default. PostgreSQL has a persistent volume and ser
 
 ## Security and privacy
 
-Ingestion keys are random and stored only as SHA-256 hashes; comparison is constant-time. Keys can be rotated from the Projects screen and the old credential is revoked immediately. Administrative reads require `AGENTSCOPE_ADMIN_TOKEN` when demo mode is disabled. CORS is an explicit allowlist. Request and batch sizes are bounded. Logs never include request bodies. Core instrumentation does not capture prompts, completions, call arguments, or results. This preview does not yet implement distributed rate limiting or production dashboard login.
+Ingestion keys and project access tokens are random, stored only as SHA-256 hashes, and compared in constant time. Viewer tokens are read-only; editor and admin roles are project-scoped, and only project admins manage membership and tokens. Administrative reads require `AGENTSCOPE_ADMIN_TOKEN` when demo mode is disabled. CORS is an explicit allowlist. Request and batch sizes are bounded. Logs never include request bodies. Core instrumentation does not capture prompts, completions, call arguments, or results. This preview does not yet implement distributed rate limiting or production browser login.
 
 ## Costs and diagnostics
 
@@ -87,7 +87,7 @@ Money uses `Decimal` and records a pricing version on each span. Unknown price o
 
 ## Operations
 
-The dashboard exposes live request/error/token/cost series, P50/P95 latency, agent/tool performance, searchable traces, cost budgets, and threshold alerts. Project settings control a deterministic trace sample rate and retention period. Error traces bypass sampling. Retention is deliberately operator-triggered: preview the affected trace count in Settings, then explicitly confirm deletion or schedule the same authenticated endpoint externally. Alert evaluation is deterministic and uses a one-hour duplicate-event cooldown.
+The dashboard exposes request/error/token/cost series, P50/P95 latency, agent/tool performance, searchable traces, deployment comparisons, cost budgets, and threshold alerts. The authenticated SSE endpoint at `/api/projects/{id}/live/traces` streams newly persisted traces. Alert events can be delivered to HTTPS webhooks with `X-Tamga-Signature-256`; set `AGENTSCOPE_WEBHOOK_SIGNING_SECRET` outside demo mode. Project settings control deterministic sampling and retention. Error traces bypass sampling. The Compose worker applies retention hourly; operators can also preview or execute it from Settings. Alert evaluation is deterministic and uses a one-hour duplicate-event cooldown.
 
 ## Development and tests
 
@@ -107,6 +107,6 @@ On 2026-11-23, PyPI's official JSON endpoint for `agentscope-ai` returned 404. T
 
 ## Roadmap
 
-Production dashboard authentication, scheduled retention/alert workers, distributed rate limiting, custom-pricing edit/delete UI, a verified LangGraph adapter, broader browser tests, and stronger deployment controls.
+Production browser authentication/OIDC, distributed rate limiting, durable webhook delivery retries, scheduled alert evaluation, custom-pricing edit UI, broader browser tests, and stronger deployment controls.
 
 MIT licensed. See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
