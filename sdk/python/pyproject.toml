@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling>=1.27,<1.28"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentscope-ai"
+version = "0.1.0rc1"
+description = "Privacy-minded OpenTelemetry instrumentation for AgentScope AI"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.12"
+authors = [{name = "AgentScope AI contributors"}]
+dependencies = [
+  "opentelemetry-api>=1.29,<2", "opentelemetry-sdk>=1.29,<2",
+  "opentelemetry-exporter-otlp-proto-http>=1.29,<2"
+]
+classifiers = ["Development Status :: 4 - Beta", "Typing :: Typed", "License :: OSI Approved :: MIT License"]
+
+[project.optional-dependencies]
+openai = ["openai>=1.59,<3"]
+langgraph = ["langgraph>=0.2,<2"]
+dev = ["build>=1.2,<2", "pytest>=8.3,<9", "ruff>=0.9,<1", "twine>=6,<7"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentscope_ai"]

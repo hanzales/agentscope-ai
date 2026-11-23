@@ -1,0 +1,3 @@
+import {get,Project} from "@/lib/api";
+type Finding={id:number;rule_id:string;severity:string;title:string;description:string;recommendation:string};
+export default async function Diagnostics(){const p=await get<Project[]>("/api/projects");const data=p.length?await get<Finding[]>(`/api/projects/${p[0].id}/diagnostics`):[];return <main><h1>Diagnostics</h1><p className="lead">Deterministic findings with direct evidence.</p>{data.length?data.map(f=><article className="panel" key={f.id}><div className="label">{f.rule_id} · {f.severity}</div><h2>{f.title}</h2><p>{f.description}</p><p><strong>Recommendation:</strong> {f.recommendation}</p></article>):<section className="panel empty">No findings. Run diagnostics after ingesting traces.</section>}</main>}
